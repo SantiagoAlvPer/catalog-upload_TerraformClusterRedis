@@ -1,10 +1,13 @@
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from "aws-lambda";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { Readable } from "stream";
 import csvParser from "csv-parser";
 import { getRedisClient } from "../services/redis.js";
 
-const s3Client = new S3Client({ region: process.env.AWS_REGION || "us-east-2" });
-const BUCKET_NAME = process.env.S3_BUCKET_NAME || "catalog-bucket";
+const s3Client = new S3Client({
+  region: process.env.AWS_REGION || "us-east-2",
+});
+const BUCKET_NAME = process.env.S3_BUCKET || "";
 
 interface ProductRecord {
   categoria: string;
@@ -16,18 +19,12 @@ interface ProductRecord {
   estado: string;
 }
 
-interface LambdaEvent {
-  body: string;
-  isBase64Encoded?: boolean;
-  headers?: Record<string, string>;
-}
-
 // Helper function to parse CSV using csv-parser
 const parseCsvContent = (csvContent: string): Promise<ProductRecord[]> => {
   return new Promise((resolve, reject) => {
     const records: ProductRecord[] = [];
     const stream = Readable.from([csvContent]);
-    
+
     stream
       .pipe(csvParser())
       .on("data", (data) => records.push(data))
@@ -36,30 +33,40 @@ const parseCsvContent = (csvContent: string): Promise<ProductRecord[]> => {
   });
 };
 
-export const handler = async (event: LambdaEvent) => {
+export const handler = async (
+  event: APIGatewayProxyEvent
+): Promise<APIGatewayProxyResult> => {
+  console.log("Event received:", JSON.stringify(event, null, 2));
+
   try {
     // 1. Obtener el contenido del CSV del body
+    if (!event.body) {
+      return {
+        statusCode: 400,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ error: "CSV content is empty or missing" }),
+      };
+    }
+
     let csvContent: string;
-    
+
     if (event.isBase64Encoded) {
       csvContent = Buffer.from(event.body, "base64").toString("utf-8");
     } else {
       csvContent = event.body;
     }
 
-    if (!csvContent || csvContent.trim().length === 0) {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ error: "CSV content is empty or missing" }),
-      };
-    }
+    console.log("CSV content length:", csvContent.length);
 
     // 2. Parsear el CSV
     const records = await parseCsvContent(csvContent);
 
+    console.log(`Parsed ${records.length} records from CSV`);
+
     if (records.length === 0) {
       return {
         statusCode: 400,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ error: "No valid records found in CSV" }),
       };
     }
@@ -67,40 +74,45 @@ export const handler = async (event: LambdaEvent) => {
     // 3. Subir el CSV a S3
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const s3Key = `catalogs/catalog-${timestamp}.csv`;
-    
+
     await s3Client.send(
       new PutObjectCommand({
         Bucket: BUCKET_NAME,
         Key: s3Key,
         Body: csvContent,
         ContentType: "text/csv",
+        Metadata: {
+          uploadedAt: new Date().toISOString(),
+          recordCount: records.length.toString(),
+        },
       })
     );
 
-    console.log(`CSV uploaded to S3: ${s3Key}`);
+    console.log(`CSV uploaded to S3: ${BUCKET_NAME}/${s3Key}`);
 
     // 4. Conectar a Redis
     const redisClient = await getRedisClient();
 
     // 5. Reemplazar completamente los datos en Redis
-    // Primero, obtener todas las keys existentes del catálogo
-    const existingKeys = await redisClient.keys("products:*");
-    
-    // Eliminar todas las keys existentes si hay
+    console.log("Cleaning existing products from Redis...");
+
+    const existingKeys = await redisClient.keys("catalog:product:*");
+
     if (existingKeys.length > 0) {
       await redisClient.del(existingKeys);
-      console.log(`Deleted ${existingKeys.length} existing product keys from Redis`);
+      console.log(
+        `Deleted ${existingKeys.length} existing product keys from Redis`
+      );
     }
 
-    // 6. Insertar los nuevos productos en Redis
+    // 6. Insertar los nuevos productos en Redis usando pipeline
+    console.log("Inserting new products into Redis...");
+
     const pipeline = redisClient.multi();
-    
-    for (const record of records) {
-      // Usar un identificador único, puede ser combinación de campos o un ID si existe
-      const productId = `${record.categoria}-${record.proveedor}-${record.servicio}`.replace(/\s+/g, "-").toLowerCase();
-      const key = `products:${productId}`;
-      
-      // Guardar como hash en Redis
+
+    records.forEach((record, index) => {
+      const key = `catalog:product:${index + 1}`;
+
       pipeline.hSet(key, {
         categoria: record.categoria || "",
         proveedor: record.proveedor || "",
@@ -110,27 +122,41 @@ export const handler = async (event: LambdaEvent) => {
         detalles: record.detalles || "",
         estado: record.estado || "Activo",
       });
-    }
+    });
+
+    // Guardar metadata del catálogo
+    pipeline.hSet("catalog:metadata", {
+      lastUpdate: new Date().toISOString(),
+      totalProducts: records.length.toString(),
+      s3Key: s3Key,
+      s3Bucket: BUCKET_NAME,
+    });
 
     await pipeline.exec();
-    console.log(`Inserted ${records.length} products into Redis`);
+    console.log(`Successfully inserted ${records.length} products into Redis`);
 
     // 7. Retornar respuesta exitosa
     return {
       statusCode: 200,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        message: "Catalog updated successfully",
-        s3Location: `s3://${BUCKET_NAME}/${s3Key}`,
-        productsUpdated: records.length,
-        productsDeleted: existingKeys.length,
+        message: "Catálogo actualizado exitosamente",
+        stats: {
+          s3Location: `s3://${BUCKET_NAME}/${s3Key}`,
+          productsUpdated: records.length,
+          productsDeleted: existingKeys.length,
+          timestamp: new Date().toISOString(),
+        },
       }),
     };
   } catch (error) {
     console.error("Error updating catalog:", error);
+
     return {
       statusCode: 500,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        error: "Failed to update catalog",
+        error: "Error al actualizar el catálogo",
         details: error instanceof Error ? error.message : String(error),
       }),
     };
