@@ -17,6 +17,7 @@
     "redis": "^5.8.3"
   },
   "devDependencies": {
+    "@types/aws-lambda": "^8.10.155",
     "@types/node": "^24.7.2",
     "esbuild": "^0.25.10",
     "typescript": "^5.9.3"
