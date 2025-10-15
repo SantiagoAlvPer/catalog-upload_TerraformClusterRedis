@@ -9,6 +9,10 @@ const s3Client = new S3Client({
 });
 const BUCKET_NAME = process.env.S3_BUCKET || "";
 
+console.log("ENV REDIS_ENDPOINT:", process.env.REDIS_ENDPOINT);
+console.log("ENV REDIS_PORT:", process.env.REDIS_PORT);
+console.log("ENV S3_BUCKET:", BUCKET_NAME);
+
 interface ProductRecord {
   categoria: string;
   proveedor: string;
@@ -26,10 +30,26 @@ const parseCsvContent = (csvContent: string): Promise<ProductRecord[]> => {
     const stream = Readable.from([csvContent]);
 
     stream
-      .pipe(csvParser())
-      .on("data", (data) => records.push(data))
-      .on("end", () => resolve(records))
-      .on("error", (error) => reject(error));
+      .pipe(csvParser({
+        mapHeaders: ({ header }) => header.trim().toLowerCase(),
+        mapValues: ({ value }) => value.trim()
+      }))
+      .on("data", (data) => {
+        console.log("Raw CSV row parsed:", JSON.stringify(data));
+        records.push(data);
+      })
+      .on("end", () => {
+        console.log(`CSV parsing complete. Total records: ${records.length}`);
+        if (records.length > 0) {
+          console.log("First record sample:", JSON.stringify(records[0]));
+          console.log("Last record sample:", JSON.stringify(records[records.length - 1]));
+        }
+        resolve(records);
+      })
+      .on("error", (error) => {
+        console.error("CSV parsing error:", error);
+        reject(error);
+      });
   });
 };
 
@@ -57,6 +77,7 @@ export const handler = async (
     }
 
     console.log("CSV content length:", csvContent.length);
+    console.log("CSV first 200 chars:", csvContent.substring(0, 200));
 
     // 2. Parsear el CSV
     const records = await parseCsvContent(csvContent);
@@ -92,6 +113,7 @@ export const handler = async (
 
     // 4. Conectar a Redis
     const redisClient = await getRedisClient();
+    console.log("Redis client connected successfully");
 
     // 5. Reemplazar completamente los datos en Redis
     console.log("Cleaning existing products from Redis...");
@@ -112,8 +134,8 @@ export const handler = async (
 
     records.forEach((record, index) => {
       const key = `catalog:product:${index + 1}`;
-
-      pipeline.hSet(key, {
+      
+      const productData = {
         categoria: record.categoria || "",
         proveedor: record.proveedor || "",
         servicio: record.servicio || "",
@@ -121,7 +143,10 @@ export const handler = async (
         precio_mensual: record.precio_mensual || "",
         detalles: record.detalles || "",
         estado: record.estado || "Activo",
-      });
+      };
+
+      console.log(`Inserting key ${key}:`, JSON.stringify(productData));
+      pipeline.hSet(key, productData);
     });
 
     // Guardar metadata del catálogo
@@ -132,10 +157,18 @@ export const handler = async (
       s3Bucket: BUCKET_NAME,
     });
 
-    await pipeline.exec();
+    const results = await pipeline.exec();
+    console.log(`Pipeline executed. Results count: ${results?.length}`);
     console.log(`Successfully inserted ${records.length} products into Redis`);
 
-    // 7. Retornar respuesta exitosa
+    // 7. Verificar que se insertó correctamente (leer el primer producto)
+    const firstProduct = await redisClient.hGetAll("catalog:product:1");
+    console.log("Verification - First product in Redis:", JSON.stringify(firstProduct));
+
+    await redisClient.quit();
+    console.log("Redis client disconnected");
+
+    // 8. Retornar respuesta exitosa
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
@@ -147,6 +180,7 @@ export const handler = async (
           productsDeleted: existingKeys.length,
           timestamp: new Date().toISOString(),
         },
+        sample: firstProduct, 
       }),
     };
   } catch (error) {
